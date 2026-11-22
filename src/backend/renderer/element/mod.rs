@@ -35,7 +35,7 @@ use crate::{
 #[cfg(feature = "wayland_frontend")]
 use super::utils::Buffer;
 use super::{
-    Color32F, Renderer,
+    Color32F, PresentationMode, Renderer,
     utils::{CommitCounter, DamageSet, OpaqueRegions},
 };
 
@@ -568,6 +568,11 @@ pub trait Element {
     fn is_framebuffer_effect(&self) -> bool {
         false
     }
+
+    /// Hint for DRM backend on how the element should be presented
+    fn presentation_mode(&self) -> PresentationMode {
+        PresentationMode::VSync
+    }
 }
 
 /// A single render element
@@ -671,6 +676,10 @@ where
 
     fn is_framebuffer_effect(&self) -> bool {
         (*self).is_framebuffer_effect()
+    }
+
+    fn presentation_mode(&self) -> PresentationMode {
+        (*self).presentation_mode()
     }
 }
 
@@ -1113,6 +1122,19 @@ macro_rules! render_elements_internal {
                 Self::_GenericCatcher(_) => unreachable!(),
             }
         }
+
+        fn presentation_mode(&self) -> $crate::backend::renderer::PresentationMode {
+            match self {
+                $(
+                    #[allow(unused_doc_comments)]
+                    $(
+                        #[$meta]
+                    )*
+                    Self::$body(x) => $crate::render_elements_internal!(@call presentation_mode; x)
+                ),*,
+                Self::_GenericCatcher(_) => unreachable!(),
+            }
+        }
     };
     (@draw <$renderer:ty>; $($(#[$meta:meta])* $body:ident=$field:ty $(as <$other_renderer:ty>)?),* $(,)?) => {
         fn draw(
@@ -1532,10 +1554,10 @@ macro_rules! render_elements_internal {
 /// #         user_data::UserDataMap,
 /// #         Buffer, Point, Physical, Rectangle, Scale, Transform,
 /// #     },
-/// # };
+/// # },
 /// #
-/// # struct MyRenderElement1;
-/// # struct MyRenderElement2;
+/// # struct MyRenderElement1,
+/// # struct MyRenderElement2,
 /// #
 /// # impl Element for MyRenderElement1 {
 /// #     fn id(&self) -> &Id {
@@ -1600,10 +1622,10 @@ macro_rules! render_elements_internal {
 /// #         unimplemented!()
 /// #     }
 /// # }
-/// use smithay::backend::renderer::element::render_elements;
+/// use smithay::backend::renderer::element::render_elements,
 ///
 /// render_elements! {
-///     MyRenderElements;
+///     MyRenderElements,
 ///     First=MyRenderElement1,
 ///     Second=MyRenderElement2,
 /// }
@@ -1619,10 +1641,10 @@ macro_rules! render_elements_internal {
 /// use smithay::backend::renderer::{
 ///     element::{memory::MemoryRenderBufferRenderElement, render_elements},
 ///     ImportMem,
-/// };
+/// },
 ///
 /// render_elements! {
-///     MyRenderElements<R> where R: ImportMem;
+///     MyRenderElements<R> where R: ImportMem,
 ///     Memory=MemoryRenderBufferRenderElement<R>,
 /// }
 /// ```
@@ -1634,10 +1656,10 @@ macro_rules! render_elements_internal {
 /// use smithay::backend::renderer::{
 ///     element::{memory::MemoryRenderBufferRenderElement, render_elements},
 ///     ImportMem,
-/// };
+/// },
 ///
 /// render_elements! {
-///     MyRenderElements<'a, R> where R: ImportMem;
+///     MyRenderElements<'a, R> where R: ImportMem,
 ///     Memory=&'a MemoryRenderBufferRenderElement<R>,
 /// }
 /// ```
@@ -1648,10 +1670,10 @@ macro_rules! render_elements_internal {
 /// use smithay::backend::renderer::{
 ///     element::{memory::MemoryRenderBufferRenderElement, render_elements},
 ///     ImportMem,
-/// };
+/// },
 ///
 /// render_elements! {
-///     MyRenderElements<'a, R, A, B> where R: ImportMem;
+///     MyRenderElements<'a, R, A, B> where R: ImportMem,
 ///     Memory=&'a MemoryRenderBufferRenderElement<R>,
 ///     Owned=A,
 ///     Borrowed=&'a B,
@@ -1668,11 +1690,11 @@ macro_rules! render_elements_internal {
 /// #         renderer::{Color32F, DebugFlags, Frame, Renderer, Texture, TextureFilter, sync::SyncPoint, gles::{GlesRenderer, GlesTexture}},
 /// #     },
 /// #     utils::{Buffer, Physical, Rectangle, Size, Transform},
-/// # };
-/// use smithay::backend::renderer::element::{render_elements, texture::TextureRenderElement};
+/// # },
+/// use smithay::backend::renderer::element::{render_elements, texture::TextureRenderElement},
 ///
 /// render_elements! {
-///     MyRenderElements<=GlesRenderer>;
+///     MyRenderElements<=GlesRenderer>,
 ///     Texture=TextureRenderElement<GlesTexture>,
 /// }
 /// ```
@@ -1801,6 +1823,10 @@ where
 
     fn is_framebuffer_effect(&self) -> bool {
         self.0.is_framebuffer_effect()
+    }
+
+    fn presentation_mode(&self) -> PresentationMode {
+        self.0.presentation_mode()
     }
 }
 

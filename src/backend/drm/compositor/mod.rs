@@ -63,6 +63,7 @@
 //!         exporter::gbm::GbmFramebufferExporter,
 //!         DrmSurface,
 //!     },
+//!     backend::renderer::PresentationMode,
 //!     output::{Output, PhysicalProperties, Subpixel},
 //!     utils::Size,
 //! };
@@ -109,7 +110,7 @@
 //!
 //! # let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
 //! let render_frame_result = compositor
-//!     .render_frame::<_, _>(&mut renderer, &elements, CLEAR_COLOR, FrameFlags::DEFAULT)
+//!     .render_frame::<_, _>(&mut renderer, &elements, CLEAR_COLOR, FrameFlags::DEFAULT, PresentationMode::VSync)
 //!     .expect("failed to render frame");
 //!
 //! if !render_frame_result.is_empty {
@@ -136,7 +137,7 @@ use std::{
 
 use drm::{
     Device, DriverCapability,
-    control::{Device as _, Mode, PlaneType, connector, crtc, framebuffer, plane},
+    control::{Device as _, Mode, PageFlipFlags, PlaneType, connector, crtc, framebuffer, plane},
 };
 use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
 use indexmap::{IndexMap, IndexSet};
@@ -160,7 +161,8 @@ use crate::{
         },
         drm::{DrmError, PlaneDamageClips, plane_has_property},
         renderer::{
-            Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture, buffer_y_inverted,
+            Bind, Color32F, DebugFlags, PresentationMode, Renderer, RendererSuper, Texture,
+            buffer_y_inverted,
             damage::{Error as OutputDamageTrackerError, OutputDamageTracker},
             element::{
                 Element, Id, Kind, RenderElement, RenderElementPresentationState, RenderElementState,
@@ -572,6 +574,7 @@ impl<B: Buffer, F: Framebuffer> Clone for PlaneState<B, F> {
 #[derive(Debug)]
 struct FrameState<B: Buffer, F: Framebuffer> {
     planes: SmallVec<[(plane::Handle, PlaneState<B, F>); 10]>,
+    async_flip_failed: bool,
 }
 
 impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
@@ -648,7 +651,10 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
                 .map(|info| (info.handle, PlaneState::default())),
         );
 
-        FrameState { planes: tmp }
+        FrameState {
+            planes: tmp,
+            async_flip_failed: false,
+        }
     }
 }
 
@@ -738,12 +744,11 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         surface: &DrmSurface,
         supports_fencing: bool,
         allow_partial_update: bool,
-        event: bool,
     ) -> Result<(), crate::backend::drm::error::Error> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
         surface.commit(
             self.build_planes(surface, supports_fencing, allow_partial_update),
-            event,
+            PageFlipFlags::EVENT,
         )
     }
 
@@ -753,12 +758,12 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         surface: &DrmSurface,
         supports_fencing: bool,
         allow_partial_update: bool,
-        event: bool,
+        flip_flags: PageFlipFlags,
     ) -> Result<(), crate::backend::drm::error::Error> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
         surface.page_flip(
             self.build_planes(surface, supports_fencing, allow_partial_update),
-            event,
+            flip_flags,
         )
     }
 
@@ -948,6 +953,7 @@ impl From<&PlaneInfo> for PlaneAssignment {
 struct PendingFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>, U> {
     frame: CompositorFrameState<A, F>,
     user_data: U,
+    presentation_mode: PresentationMode,
 }
 
 impl<A, F, U> std::fmt::Debug for PendingFrame<A, F, U>
@@ -996,6 +1002,7 @@ enum PreparedFrameKind {
 struct PreparedFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>> {
     frame: CompositorFrameState<A, F>,
     kind: PreparedFrameKind,
+    presentation_mode: PresentationMode,
 }
 
 impl<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>> PreparedFrame<A, F> {
@@ -1038,11 +1045,24 @@ bitflags::bitflags! {
         const ALLOW_CURSOR_PLANE_SCANOUT = 8;
         /// Return `EmptyFrame`, if only the cursor plane would have been updated
         const SKIP_CURSOR_ONLY_UPDATES = 16;
+        /// Present a frame rendered with [`PresentationMode::Async`] with vsync instead when
+        /// its primary plane holds the swapchain, so only directly scanned out buffers tear
+        const ASYNC_SCANOUT_ONLY = 32;
         /// Allow to realize the frame by assigning elements on any plane
         const ALLOW_SCANOUT = Self::ALLOW_PRIMARY_PLANE_SCANOUT.bits() | Self::ALLOW_OVERLAY_PLANE_SCANOUT.bits() | Self::ALLOW_CURSOR_PLANE_SCANOUT.bits();
         /// Safe default set of flags
         const DEFAULT = Self::ALLOW_SCANOUT.bits();
     }
+}
+
+/// A reference to a frame
+#[derive(Debug)]
+pub struct FrameRef<'a, U> {
+    /// User-data of the frame
+    pub user_data: &'a U,
+
+    /// Presentation mode of this frame
+    pub presentation_mode: PresentationMode,
 }
 
 /// Composite an output using a combination of planes and rendering
@@ -1693,6 +1713,7 @@ where
         elements: &'a [E],
         clear_color: impl Into<Color32F>,
         frame_flags: FrameFlags,
+        presentation_mode: PresentationMode,
     ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
     where
         E: RenderElement<R>,
@@ -2032,6 +2053,7 @@ where
                 output_geometry,
                 try_assign_primary_plane,
                 frame_flags,
+                presentation_mode,
             ) {
                 Ok(direct_scan_out_plane) => {
                     match direct_scan_out_plane.type_ {
@@ -2399,6 +2421,13 @@ where
             }
         }
 
+        let presentation_mode = if frame_flags.contains(FrameFlags::ASYNC_SCANOUT_ONLY)
+            && matches!(primary_plane_element, PrimaryPlaneElement::Swapchain(_))
+        {
+            PresentationMode::VSync
+        } else {
+            presentation_mode
+        };
         let next_frame = PreparedFrame {
             kind: if allow_partial_update {
                 PreparedFrameKind::Partial
@@ -2406,6 +2435,7 @@ where
                 PreparedFrameKind::Full
             },
             frame: next_frame_state,
+            presentation_mode,
         };
         let frame_reference: RenderFrameResult<'a, A::Buffer, F::Framebuffer, E> = RenderFrameResult {
             is_empty: next_frame.is_empty(),
@@ -2515,7 +2545,8 @@ where
 
         let flip = prepared_frame
             .frame
-            .commit(&self.surface, self.supports_fencing, false, false);
+            .commit(&self.surface, self.supports_fencing, false)
+            .map(|_| PresentationMode::VSync);
 
         let res = self.handle_flip(&prepared_frame, flip);
 
@@ -2525,7 +2556,7 @@ where
             self.current_frame = prepared_frame.frame;
         }
 
-        res
+        res.map(|_| ())
     }
 
     /// Re-evaluates the current state of the crtc and forces calls to [`render_frame`](DrmCompositor::render_frame)
@@ -2544,7 +2575,7 @@ where
     }
 
     #[profiling::function]
-    fn submit(&mut self) -> FrameResult<(), A, F> {
+    fn submit(&mut self) -> FrameResult<PresentationMode, A, F> {
         let QueuedFrame {
             mut prepared_frame,
             user_data,
@@ -2554,19 +2585,101 @@ where
         let flip = if self.surface.commit_pending() {
             prepared_frame
                 .frame
-                .commit(&self.surface, self.supports_fencing, allow_partial_update, true)
+                .commit(&self.surface, self.supports_fencing, allow_partial_update)
+                .map(|_| PresentationMode::VSync)
         } else {
-            prepared_frame
+            let previous_state = self
+                .pending_frame
+                .as_ref()
+                .map(|f| &f.frame)
+                .unwrap_or(&self.current_frame);
+
+            let primary_is_compatible = prepared_frame
                 .frame
-                .page_flip(&self.surface, self.supports_fencing, allow_partial_update, true)
+                .plane_state(self.plane())
+                .and_then(|state| {
+                    previous_state
+                        .plane_state(self.plane())
+                        .map(|previous_state| previous_state.is_compatible(state))
+                })
+                .unwrap_or(false);
+
+            // If the properties of the plane did not change we can expect the async flip state to
+            // also stay unchanged. So in case it failed previously we can skip trying again.
+            if primary_is_compatible {
+                prepared_frame.frame.async_flip_failed = previous_state.async_flip_failed;
+            }
+
+            // Currently async page flips are limited to the primary plane, if any other plane
+            // changes (including the cursor plane) it will fail.
+            //
+            // Note: If this changes we should extend `PlaneInfo` to include a flag indicating
+            // async flip support per plane. This would allows us to check for compatible changes
+            // per plane that supports async flips here. But that also requires us to track the failed
+            // combinations.
+            let only_primary_changed = prepared_frame
+                .frame
+                .planes
+                .iter()
+                .filter(|&(handle, _)| *handle != self.plane())
+                .all(|(_, state)| state.skip);
+
+            let mut flip_flags = PageFlipFlags::EVENT;
+
+            // As already noted async page flips are only allowed when only the primary plane
+            // changed in a compatible way. We also want to skip it in case we already tried
+            // and failed. An async page flip can for example also fail for certain modifiers,
+            // for example on intel compressed formats might not be allowed.
+            if prepared_frame.presentation_mode == PresentationMode::Async
+                && only_primary_changed
+                && primary_is_compatible
+                && allow_partial_update
+                && !prepared_frame.frame.async_flip_failed
+            {
+                flip_flags |= PageFlipFlags::ASYNC;
+            }
+
+            let flip = prepared_frame
+                .frame
+                .page_flip(
+                    &self.surface,
+                    self.supports_fencing,
+                    allow_partial_update,
+                    flip_flags,
+                )
+                .map(|_| {
+                    if flip_flags.contains(PageFlipFlags::ASYNC) {
+                        PresentationMode::Async
+                    } else {
+                        PresentationMode::VSync
+                    }
+                });
+
+            // If an async page flip fails we retry without async and note
+            // that it failed to not try again until the plane properties change.
+            if flip.is_err() && flip_flags.contains(PageFlipFlags::ASYNC) {
+                prepared_frame.frame.async_flip_failed = true;
+                prepared_frame
+                    .frame
+                    .page_flip(
+                        &self.surface,
+                        self.supports_fencing,
+                        allow_partial_update,
+                        PageFlipFlags::EVENT,
+                    )
+                    .map(|_| PresentationMode::VSync)
+            } else {
+                flip
+            }
         };
 
         let res = self.handle_flip(&prepared_frame, flip);
 
-        if res.is_ok() {
+        if let Ok(presentation_mode) = res {
             self.pending_frame = Some(PendingFrame {
                 frame: prepared_frame.frame,
                 user_data,
+                presentation_mode,
             });
         }
 
@@ -2576,8 +2689,8 @@ where
     fn handle_flip(
         &mut self,
         prepared_frame: &PreparedFrame<A, F>,
-        flip: Result<(), crate::backend::drm::error::Error>,
-    ) -> FrameResult<(), A, F> {
+        flip: Result<PresentationMode, crate::backend::drm::error::Error>,
+    ) -> FrameResult<PresentationMode, A, F> {
         match flip {
             Ok(_) => {
                 if prepared_frame.kind == PreparedFrameKind::Full {
@@ -2615,22 +2728,42 @@ where
         flip.map_err(FrameError::DrmError)
     }
 
+    /// Access the currently pending frame without submitting it
+    pub fn pending_frame(&self) -> Option<FrameRef<'_, U>> {
+        self.pending_frame.as_ref().map(|frame| FrameRef {
+            user_data: &frame.user_data,
+            presentation_mode: frame.presentation_mode,
+        })
+    }
+
+    /// Access the currently queued frame
+    pub fn queued_frame(&self) -> Option<FrameRef<'_, U>> {
+        self.queued_frame.as_ref().map(|frame| FrameRef {
+            user_data: &frame.user_data,
+            presentation_mode: frame.prepared_frame.presentation_mode,
+        })
+    }
+
     /// Marks the current frame as submitted.
     ///
     /// *Note*: Needs to be called, after the vblank event of the matching [`DrmDevice`](super::DrmDevice)
     /// was received after calling [`DrmCompositor::queue_frame`] on this surface.
     /// Otherwise the underlying swapchain will run out of buffers eventually.
     #[profiling::function]
-    pub fn frame_submitted(&mut self) -> FrameResult<Option<U>, A, F> {
-        if let Some(PendingFrame { mut frame, user_data }) = self.pending_frame.take() {
-            std::mem::swap(&mut frame, &mut self.current_frame);
-            if self.queued_frame.is_some() {
-                self.submit()?;
-            }
-            Ok(Some(user_data))
-        } else {
-            Ok(None)
+    pub fn frame_submitted(&mut self) -> FrameResult<U, A, F> {
+        let Some(PendingFrame {
+            mut frame, user_data, ..
+        }) = self.pending_frame.take()
+        else {
+            return Err(FrameError::EmptyFrame);
+        };
+
+        std::mem::swap(&mut frame, &mut self.current_frame);
+        if self.queued_frame.is_some() {
+            self.submit()?;
         }
+
+        Ok(user_data)
     }
 
     /// Reset the underlying buffers
@@ -2882,6 +3015,7 @@ where
         output_geometry: Rectangle<i32, Physical>,
         try_assign_primary_plane: bool,
         frame_flags: FrameFlags,
+        presentation_mode: PresentationMode,
     ) -> Result<PlaneAssignment, Option<RenderingReason>>
     where
         R: Renderer + Bind<Dmabuf>,
@@ -2924,6 +3058,15 @@ where
                 }
                 Err(err) => rendering_reason = rendering_reason.or(err),
             };
+        }
+
+        // FIXME: For now we just skip all overlay planes if the requested
+        // mode is not sync. With support for IN_FORMATS_ASYNC we might be
+        // able to lift this restriction again. With IN_FORMATS_ASYNC we should
+        // be able to check if the element requested async using Element::presentation_mode
+        // and check the plane IN_FORMATS_ASYNC against the element buffer format.
+        if presentation_mode != PresentationMode::VSync {
+            return Err(None);
         }
 
         if let Some(plane) = self.try_assign_cursor_plane(
